@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template that creates SageMaker Domain and invokes Stack Maker function
+
+Parameters:
+  CentralNetworkBucket:
+    Type: String
+  VPCTGWSubnetCidr:
+    Type: String
+    AllowedPattern: '([0-9]{1,3}\.){3}[0-9]{1,3}($|\/[0-9]{1,2})'
+  VPCCidrPrefix:
+    Type: String
+    AllowedPattern: '([0-9]{1,3}\.){3}[0-9]{1,3}($|\/[0-9]{1,2})'
+  VPCTransitGateway:
+    Type: String
+    AllowedPattern: 'tgw-([a-z0-9]{17})'
+  VPCShareAccountIds:
+    Type: String
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: \d{12}
+  VPCEnvironment:
+    Type: String
+  CentralNetworkAccountId:
+    Type: String
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: \d{12}
+  CentralNetworkAccountRoleName:
+    Type: String
+  CentralNetworkTemplateKey:
+    Type: String
+  AccountName:
+    Type: String
+    Description: Account Name (in lowercase) eg. xaas, pcaas etc.
+    MaxLength: 10
+    AllowedPattern: ^[a-z]+$
+  ProjectName:
+    Type: String
+    Description: Project UseCase (in lowercase) on Jira Ticket
+    MaxLength: 10
+    AllowedPattern: ^[a-z]+$
+  JupyterServerDefaultLCCArn:
+    Type: String
+    AllowedPattern: arn:aws:sagemaker:[a-z]{2}-[a-z\-]{4,9}-\d:\d{12}:studio-lifecycle-config/[a-zA-Z0-9\-]{1,63}
+    ConstraintDescription: Allowed pattern expect an ARN for Jupyter Server lifecycle configuration
+  CFNStackManagerFuncArn:
+    Type: String
+    AllowedPattern: 'arn:aws:lambda:(\w{2}-\w{4,9}-[1-4]):(\d{12}):function:([_a-zA-Z0-9-]+)'
+  ArtifactBucket:
+    Type: String
+  PortfolioId:
+    Type: String
+    AllowedPattern: 'port-([a-z0-9]{13})'
+  CustomResourceLambdaArn:
+    Type: String
+    AllowedPattern: 'arn:aws:lambda:(\w{2}-\w{4,9}-[1-4]):(\d{12}):function:([_a-zA-Z0-9-]+)'
+
+Conditions:
+  SagemakerSSOAuthMode: !Equals [ !Ref AWS::Region, "us-east-1" ]
+  SagemakerIAMAuthMode: !Not [!Equals [ !Ref AWS::Region, "us-east-1" ]]
+
+Resources:
+  network:
+    Type: Custom::CfnStackMaker
+    Version: 1.0
+    Properties:
+      ServiceToken: !Ref CFNStackManagerFuncArn
+      RoleArn: !Sub arn:${AWS::Partition}:iam::${CentralNetworkAccountId}:role/${CentralNetworkAccountRoleName}
+      TemplateURL: !Sub https://${CentralNetworkBucket}.s3.${AWS::Region}.${AWS::URLSuffix}/${CentralNetworkTemplateKey}
+      ParentStackId: !Ref AWS::StackId
+      Region: !Sub ${AWS::Region}
+      CfnParameters:
+        Environment: !Ref VPCEnvironment
+        ShareAccountIds: !Ref VPCShareAccountIds
+        SubEnvironmentName: !Ref VPCEnvironment
+        CidrPrefix: !Ref VPCCidrPrefix
+        TransitGateway: !Ref VPCTransitGateway
+        TGWSubnetCidr: !Ref VPCTGWSubnetCidr
+        TransitGatewayRouteTable: '{{resolve:ssm:/saas-platform/PLATFORM_TENANT_MLPROD_TRANSITGATEWAYROUTETABLE}}'
+
+  SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !GetAtt network.PrivateVpc
+      GroupName: !Sub
+            - SG-${VPCEnvironment}-codebuild-${ProjectName}-${StackId}
+            - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      GroupDescription: Security Group for Codebuild-Project
+
+  SageMakerDomain:
+    Type: AWS::SageMaker::Domain
+    Condition: SagemakerSSOAuthMode # SageMakerDomain with SSO as an AuthMode  will be created only if SagemakerSSOAuthMode condition is true. 
+    DeletionPolicy: Retain #Deletion is handeled by DeleteDomainWithEFS
+    #https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/1085
+    Properties:
+      AppNetworkAccessType: VpcOnly
+      AppSecurityGroupManagement: Customer
+      AuthMode: SSO
+      TagPropagation: ENABLED
+      DomainSettings:
+        DockerSettings:
+          EnableDockerAccess: ENABLED
+      DomainName: !Sub
+        - ${AccountName}-mlprod-${ProjectName}-${StackId}
+        - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      SubnetIds:
+        - !GetAtt network.PrivateSubnet1
+        - !GetAtt network.PrivateSubnet2
+      VpcId: !GetAtt network.PrivateVpc
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        StudioWebPortal: ENABLED
+        DefaultLandingUri: 'studio::'
+        CodeEditorAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+        JupyterLabAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+        JupyterServerAppSettings:
+          DefaultResourceSpec:
+            InstanceType: system
+            LifecycleConfigArn: !Ref JupyterServerDefaultLCCArn
+          LifecycleConfigArns:
+            - !Ref JupyterServerDefaultLCCArn
+        # Add LifecycleConfigArns when the cfn issue is resolved, till then set LCC config as default via console
+        # https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/1568
+        SecurityGroups:
+          - !Ref SageMakerVpcSecurityGroup
+      DefaultSpaceSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        JupyterLabAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+          - SageMakerExecutionRoleDomain-${ProjectName}-${StackId}
+          - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: "sagemaker_domain_policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Sid: ResourceWildCard
+              Effect: Allow
+              Action:
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListStackResources
+              - codecommit:BatchGetRepositories
+              - codecommit:GetRepository
+              - codecommit:List*
+              - config:DescribeConfigurationRecorders
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - sagemaker:AddTags
+              - sagemaker:CreatePresigned*
+              - sagemaker:CreateProject
+              - sagemaker:CreateSpace
+              - sagemaker:DeleteProject
+              - sagemaker:DeleteSpace
+              - sagemaker:Describe*
+              - sagemaker:GetSagemakerServicecatalogPortfolioStatus
+              - sagemaker:List*
+              - sagemaker:Search
+              - sagemaker:UpdateSpace
+              Resource: "*"
+            - Action:
+              - s3:AbortMultipartUpload
+              - s3:DeleteObj*
+              - s3:GetObj*
+              - s3:ListBuck*
+              - s3:PutObj*
+              Effect: Allow
+              Resource: 
+              - !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/*
+            - Effect: Allow
+              Action:
+              - sagemaker:CreateProject
+              - servicecatalog:CreateProvisionedProductPlan
+              - servicecatalog:DeleteProvisionedProductPlan
+              - servicecatalog:Describe*
+              - servicecatalog:ExecuteProvisionedProductPlan
+              - servicecatalog:List*
+              - servicecatalog:ProvisionProduct
+              - servicecatalog:ScanProvisionedProducts
+              - servicecatalog:SearchProducts
+              - servicecatalog:SearchProvisionedProducts
+              - servicecatalog:TerminateProvisionedProduct
+              - servicecatalog:UpdateProvisionedProduct
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  servicecatalog:userLevel: self
+            - Sid: sagemakerLimitInstanceTypesforApps
+              Effect: Allow
+              Action:
+              - sagemaker:CreateApp
+              Resource: "*"
+              Condition:
+                ForAnyValue:StringLike:
+                  sagemaker:InstanceTypes:
+                  - ml.t3.*
+                  - system
+                  - default
+            - Sid: codecommitDeny
+              Effect: Deny
+              Action:
+              - codecommit:GitPush
+              - codecommit:DeleteBranch
+              - codecommit:MergeBranchesByFastForward
+              - codecommit:MergeBranchesBySquash
+              - codecommit:MergeBranchesByThreeWay
+              Resource: "*"
+              Condition:
+                StringEqualsIfExists:
+                  codecommit:References:
+                  - refs/heads/main
+                  - refs/heads/develop
+                  - refs/heads/release
+                'Null':
+                  codecommit:References: 'false'
+            - Effect: Allow
+              Action: 
+                - logs:CreateLogDelivery
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:DeleteLogDelivery
+                - logs:DescribeLogGroups
+                - logs:DescribeResourcePolicies
+                - logs:GetLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutLogEvents
+                - logs:PutResourcePolicy
+                - logs:UpdateLogDelivery
+              Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+            - Effect: Allow
+              Action:
+                - codeartifact:DescribePackageVersion
+                - codeartifact:DescribeRepository
+                - codeartifact:Get*
+                - codeartifact:List*
+                - codeartifact:ReadFromRepository
+              Resource:
+                - !Sub "arn:${AWS::Partition}:codeartifact:${AWS::Region}:${AWS::AccountId}:package/*"
+                - !Sub "arn:${AWS::Partition}:codeartifact:${AWS::Region}:${AWS::AccountId}:repository/*"
+                - !Sub "arn:${AWS::Partition}:codeartifact:${AWS::Region}:${AWS::AccountId}:domain/*"
+            - Sid: "ca02"
+              Effect: Allow
+              Action: "sts:GetServiceBearerToken"
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  "sts:AWSServiceName": "codeartifact.amazonaws.com"
+
+  SageMakerVpcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !GetAtt network.PrivateVpc
+      GroupDescription: "Security Group for SageMaker VPC access"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8192
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  IAMSageMakerDomain:
+    Type: AWS::SageMaker::Domain
+    Condition: SagemakerIAMAuthMode # SageMakerDomain with IAM as an AuthMode  will be created only if SagemakerIAMAuthMode condition is true.    
+    DeletionPolicy: Retain #Deletion is handeled by DeleteIAMDomainWithEFS
+    #https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/1085
+    Properties:
+      AppNetworkAccessType: VpcOnly
+      AppSecurityGroupManagement: Customer
+      AuthMode: IAM
+      TagPropagation: ENABLED
+      DomainName: !Sub
+        - ${AccountName}-mlprod-${ProjectName}-${StackId}
+        - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      SubnetIds:
+        - !GetAtt network.PrivateSubnet1
+        - !GetAtt network.PrivateSubnet2
+      VpcId: !GetAtt network.PrivateVpc
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        StudioWebPortal: ENABLED
+        DefaultLandingUri: 'studio::'
+        CodeEditorAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+        JupyterLabAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+        JupyterServerAppSettings:
+          DefaultResourceSpec:
+            InstanceType: system
+            LifecycleConfigArn: !Ref JupyterServerDefaultLCCArn
+          LifecycleConfigArns:
+            - !Ref JupyterServerDefaultLCCArn
+        # Add LifecycleConfigArns when the cfn issue is resolved, till then set LCC config as default via console
+        # https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/1568
+        SecurityGroups:
+          - !Ref SageMakerVpcSecurityGroup
+      DefaultSpaceSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        JupyterLabAppSettings:
+          AppLifecycleManagement:
+            IdleSettings:
+              LifecycleManagement: ENABLED
+              IdleTimeoutInMinutes: 60
+              MinIdleTimeoutInMinutes: 60
+              MaxIdleTimeoutInMinutes: 240
+
+  SSMParameter1:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub
+      - /${StackId}/VPC
+      - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Type: String
+      Value: !GetAtt network.PrivateVpc
+
+  SSMParameter2:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub
+      - /${StackId}/SG
+      - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Type: String
+      Value: !Ref SG
+
+  SSMParameter3:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub
+      - /${StackId}/PRIVATE_SUBNET1
+      - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Type: String
+      Value: !GetAtt network.PrivateSubnet1
+
+  SSMParameter4:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub
+      - /${StackId}/PRIVATE_SUBNET2
+      - StackId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Type: String
+      Value: !GetAtt network.PrivateSubnet2
+
+  AssociateRoleWithPortfolio:
+    Type: Custom::AssociateRoleWithPortfolio
+    Properties:
+      ServiceToken: !Ref CustomResourceLambdaArn
+      Action: AssociateRoleToPortfolio
+      PortfolioId: !Ref PortfolioId
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+
+  DeleteDomainWithEFS:
+    Type: Custom::DeleteDomainWithEFS
+    Condition: SagemakerSSOAuthMode
+    Properties:
+      ServiceToken: !Ref CustomResourceLambdaArn
+      Action: DeleteDomainWithEFS
+      DomainId: !GetAtt SageMakerDomain.DomainId
+  
+  DeleteIAMDomainWithEFS:
+    Type: Custom::DeleteDomainWithEFS
+    Condition: SagemakerIAMAuthMode
+    Properties:
+      ServiceToken: !Ref CustomResourceLambdaArn
+      Action: DeleteDomainWithEFS
+      DomainId: !GetAtt IAMSageMakerDomain.DomainId
+
+Outputs:
+  SecurityGroupId:
+    Description: VPC Security Group
+    Value: !Ref SG
+  PrivateSubnet1:
+    Description: VPC Private Subnet1
+    Value: !GetAtt network.PrivateSubnet1
+  PrivateSubnet2:
+    Description: VPC Private Subnet2
+    Value: !GetAtt network.PrivateSubnet2
+  VPCId:
+    Description: VPC Id
+    Value: !GetAtt network.PrivateVpc
+  SageMakerExecutionRoleArn:
+    Description: SageMaker Execution Role Arn
+    Value: !GetAtt SageMakerExecutionRole.Arn
+  SSOSageMakerDomainID:
+    Description: "SageMaker Domain ID"
+    Value: !Ref SageMakerDomain
+    Condition: SagemakerSSOAuthMode # Output will be displayed only if SagemakerSSOAuthMode condition is true.       
+  IAMSageMakerDomainID:
+    Description: "SageMaker Domain ID"
+    Value: !Ref IAMSageMakerDomain
+    Condition: SagemakerIAMAuthMode # Output will be displayed only if SagemakerIAMAuthMode condition is true.  
+  SSMParameter1:
+    Value: !Ref SSMParameter1
+    Description: 'SSM Parameter store which contains VPC ID'
+  SSMParameter2:
+    Value: !Ref SSMParameter2
+    Description: 'SSM Parameter store which contains Security Group ID'
+  SSMParameter3:
+    Value: !Ref SSMParameter3
+    Description: 'SSM Parameter store which contains PRIVATE_SUBNET1 ID'
+  SSMParameter4:
+    Value: !Ref SSMParameter4
+    Description: 'SSM Parameter store which contains PRIVATE_SUBNET2 ID'
